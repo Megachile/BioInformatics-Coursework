@@ -1,0 +1,808 @@
+---
+title: "Analysis of Gene Expression Patterns Across Alzheimer's Disease Progression Using Machine Learning Approaches"
+author: "Edward Davis and Adam Kranz"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  pdf_document:
+    toc: yes
+    latex_engine: xelatex
+  bookdown::pdf_document2:
+    toc: yes
+    geometry: margin=1in
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, 
+  message = FALSE, 
+  warning = FALSE,
+  tidy = TRUE,
+  tidy.opts = list(width.cutoff = 60)
+)
+
+```
+
+``` {r libraries, include=FALSE}
+# Load required libraries
+library(GEOquery)
+library(AnnotationDbi)
+library(hgu133plus2.db)
+library(dplyr)
+library(ggplot2)
+library(limma)
+library(edgeR)
+library(pheatmap)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(glmnet)
+library(caret)
+library(doParallel)
+library(plotly)
+library(RColorBrewer)
+library(ordinalNet) 
+library(MASS)     
+library(ComplexHeatmap)
+library(circlize)
+library(VennDiagram)
+library(grid)
+library(reshape2)
+```
+
+## 1. Import and Filter Data
+
+``` {r data setup}
+set.seed(123)
+
+# Load the dataset
+gset <- getGEO("GSE48350", GSEMatrix = TRUE, getGPL = FALSE)
+if (length(gset) > 1) idx <- grep("GPL570", attr(gset, "names")) else idx <- 1
+gset <- gset[[idx]]
+
+# Extract phenotype data
+pheno_data <- pData(gset)
+
+# Process phenotype data
+process_phenotype_data <- function(pheno_data) {
+  # Create dataframe with the actual column names
+  clean_data <- data.frame(
+    Sample = pheno_data$geo_accession,
+    Brain_Region = pheno_data$`brain region:ch1`,
+    Braak = pheno_data$`braak stage:ch1`,
+    Age = as.numeric(pheno_data$`age (yrs):ch1`),
+    Gender = pheno_data$`gender:ch1`,
+    APOE = pheno_data$`apoe genotype:ch1`
+  )
+  
+  # Map Braak stages to ordered factor
+  clean_data$Braak <- factor(clean_data$Braak, levels = c("0", "I", "II", "III", "IV", "V", "VI"), ordered = TRUE)
+  
+  # Standardize Brain Region names
+  clean_data$Brain_Region <- as.character(clean_data$Brain_Region)
+  clean_data$Brain_Region[clean_data$Brain_Region == "post-central gyrus"] <- "postcentral gyrus"
+  clean_data$Brain_Region <- factor(clean_data$Brain_Region)
+  
+  # Convert Gender and APOE to factors
+  clean_data$Gender <- factor(clean_data$Gender)
+  clean_data$APOE <- factor(clean_data$APOE)
+  
+  return(clean_data)
+}
+
+# Process the phenotype data
+sample_data <- process_phenotype_data(pheno_data)
+
+# Extract expression data
+ex <- exprs(gset)
+
+# Log2 transform
+  ex <- log2(ex)
+
+# Normalize between arrays
+ex_norm <- normalizeBetweenArrays(ex, method = "quantile")
+
+# Filter out control probes and unannotated probes
+# Get probe annotation data
+probe_annotations <- AnnotationDbi::select(
+  hgu133plus2.db,
+  keys = rownames(ex_norm),
+  columns = c("PROBEID", "SYMBOL", "ENTREZID", "GENENAME"),
+  keytype = "PROBEID"
+)
+
+# Remove probes without gene symbols or Entrez IDs
+probe_annotations_filtered <- probe_annotations %>%
+  filter(!is.na(SYMBOL) & !is.na(ENTREZID))
+
+# Remove control probes (those starting with "AFFX")
+control_probes <- grep("^AFFX", probe_annotations_filtered$PROBEID, value = TRUE)
+probe_annotations_filtered <- probe_annotations_filtered %>%
+  filter(!PROBEID %in% control_probes)
+
+# Remove duplicate probes (keep the one with highest average expression)
+average_expression <- rowMeans(ex_norm)
+probe_annotations_filtered$AvgExpr <- average_expression[probe_annotations_filtered$PROBEID]
+
+probe_annotations_unique <- probe_annotations_filtered %>%
+  group_by(SYMBOL) %>%
+  top_n(1, AvgExpr) %>%
+  ungroup()
+
+# Create list of filtered probe IDs
+filtered_probe_ids <- probe_annotations_unique$PROBEID
+
+# Subset the expression data to keep only filtered probes
+ex_filtered <- ex_norm[filtered_probe_ids, ]
+
+# Update row names to gene symbols
+rownames(ex_filtered) <- probe_annotations_unique$SYMBOL
+
+# Exclude Outlier Samples
+# -----------------------
+# Perform initial PCA to identify outliers
+pca_initial <- prcomp(t(ex_filtered), scale. = TRUE)
+pc1_scores <- pca_initial$x[, 1]
+
+# Identify outlier samples based on PC1 threshold
+outlier_threshold <- quantile(pc1_scores, 0.99)
+outlier_samples <- names(pc1_scores[abs(pc1_scores) > outlier_threshold])
+
+# Exclude outlier samples from expression data and sample data
+ex_filtered <- ex_filtered[, !colnames(ex_filtered) %in% outlier_samples]
+sample_data <- sample_data[!sample_data$Sample %in% outlier_samples, ]
+
+# Ensure samples are aligned between expression data and sample data
+sample_data <- sample_data[match(colnames(ex_filtered), sample_data$Sample), ]
+stopifnot(all(sample_data$Sample == colnames(ex_filtered)))
+
+# Handle Missing Braak Stages
+
+# Assign Braak stage "0" to samples with missing Braak stages
+missing_braak <- is.na(sample_data$Braak)
+sample_data$Braak[missing_braak] <- "0"
+sample_data$Braak <- factor(sample_data$Braak, levels = c("0", "I", "II", "III", "IV", "V", "VI"), ordered = TRUE)
+
+cat("Unique Genes After Filtering: ", length(unique(probe_annotations_unique$SYMBOL)), "\n")
+cat("Total Samples: ", nrow(sample_data), "\n")
+cat("Distribution by Braak Stage:\n")
+print(table(sample_data$Braak))
+```
+
+## 2. Exploratory PCA analysis by Braak stage, brain region, and disease status
+
+```{r PCA}
+# Perform PCA on the filtered expression data without outliers
+pca_result <- prcomp(t(ex_filtered), scale. = TRUE)
+
+# Calculate variance explained
+var_explained <- pca_result$sdev^2 / sum(pca_result$sdev^2)
+
+# Create dataframe for plotting
+pca_data <- data.frame(
+  PC1 = pca_result$x[, 1],
+  PC2 = pca_result$x[, 2],
+  PC3 = pca_result$x[, 3],
+  Braak = sample_data$Braak,
+  Brain_Region = sample_data$Brain_Region,
+  Disease = ifelse(sample_data$Braak == "0", "Control", "AD"),
+  Gender = sample_data$Gender
+)
+
+# PCA Plots
+
+# PCA colored by Braak stage
+p1 <- ggplot(pca_data, aes(x = PC1, y = PC2, color = Braak)) +
+  geom_point(size = 3, alpha = 0.7) +
+  theme_minimal() +
+  labs(
+    title = "PCA by Braak Stage (Outliers Excluded)",
+    x = paste0("PC1 (", round(var_explained[1] * 100, 1), "% Variance Explained)"),
+    y = paste0("PC2 (", round(var_explained[2] * 100, 1), "% Variance Explained)")
+  ) +
+  scale_color_brewer(palette = "Spectral") +
+  theme(legend.position = "bottom")
+
+# PCA colored by Brain Region
+p2 <- ggplot(pca_data, aes(x = PC1, y = PC2, color = Brain_Region)) +
+  geom_point(size = 3, alpha = 0.7) +
+  theme_minimal() +
+  labs(
+    title = "PCA by Brain Region (Outliers Excluded)",
+    x = paste0("PC1 (", round(var_explained[1] * 100, 1), "% Variance Explained)"),
+    y = paste0("PC2 (", round(var_explained[2] * 100, 1), "% Variance Explained)")
+  ) +
+  scale_color_brewer(palette = "Set1") +
+  theme(legend.position = "bottom")
+
+# PCA colored by Disease Status
+p3 <- ggplot(pca_data, aes(x = PC1, y = PC2, color = Disease)) +
+  geom_point(size = 3, alpha = 0.7) +
+  theme_minimal() +
+  labs(
+    title = "PCA by Disease Status (Outliers Excluded)",
+    x = paste0("PC1 (", round(var_explained[1] * 100, 1), "% Variance Explained)"),
+    y = paste0("PC2 (", round(var_explained[2] * 100, 1), "% Variance Explained)")
+  ) +
+  scale_color_manual(values = c("Control" = "#1B9E77", "AD" = "#D95F02")) +
+  theme(legend.position = "bottom")
+
+# Display PCA plots
+print(p1)
+print(p2)
+print(p3)
+
+```
+
+## 3. Differentially expressed gene analysis 
+
+### 3.1 DEGs by Disease v Control
+
+``` {r DEGs}
+# Set up design matrix for Control vs AD
+sample_data$Status <- ifelse(sample_data$Braak == "0", "Control", "AD")
+design <- model.matrix(~ 0 + Status, data = sample_data)
+colnames(design) <- c("Control", "AD")
+
+# Create contrast matrix
+contrast_matrix <- makeContrasts(
+  AD_vs_Control = AD - Control,
+  levels = design
+)
+
+# Fit linear model
+fit <- lmFit(ex_filtered, design)
+fit2 <- contrasts.fit(fit, contrast_matrix)
+fit2 <- eBayes(fit2)
+
+# Get significant genes
+significant_genes <- topTable(fit2, coef = 1, number = Inf, p.value = 0.05)
+control_vs_ad_degs <- significant_genes 
+
+# Add logFC to dataframe
+significant_genes$logFC <- fit2$coefficients[rownames(significant_genes),]
+
+# Output number of significant genes
+cat("Number of significant genes:", nrow(significant_genes), "\n")
+
+# Get top 10 DE genes
+top_deg_list <- significant_genes %>%
+  mutate(SYMBOL = rownames(significant_genes)) %>%
+  arrange(desc(abs(logFC))) %>%
+  head(10) %>%
+  dplyr::select(SYMBOL, logFC, adj.P.Val)
+
+# prepare GO for top 10 genes
+top_10_symbols <- top_deg_list$SYMBOL
+top_10_entrez <- probe_annotations_unique$ENTREZID[match(top_10_symbols, probe_annotations_unique$SYMBOL)]
+
+go_top10 <- lapply(na.omit(top_10_entrez), function(gene) {
+    go_terms <- AnnotationDbi::select(
+        org.Hs.eg.db,
+        keys = gene,
+        columns = c("SYMBOL", "GENENAME"),
+        keytype = "ENTREZID"
+    )
+    return(go_terms)
+})
+
+#  Combine results into a data frame
+go_top10_df <- do.call(rbind, go_top10)
+
+#  Filter for top 10 DE genes and remove duplicates
+go_top10_summary <- go_top10_df %>%
+  filter(SYMBOL %in% top_10_symbols) %>%
+  distinct(SYMBOL, .keep_all = TRUE) %>%  
+  dplyr::select(SYMBOL, GENENAME)         
+
+# Match the order with top_deg_list
+go_top10_summary <- go_top10_summary %>%
+  arrange(match(SYMBOL, top_10_symbols))
+
+# Merge the two data frames by "Gene Symbol"
+combined_table <- top_deg_list %>%
+  inner_join(go_top10_summary, by = c("SYMBOL" = "SYMBOL")) %>%
+  dplyr::select(SYMBOL, GENENAME, logFC, adj.P.Val)
+
+knitr::kable(
+  combined_table,
+  col.names = c("Gene Symbol", "Gene Name", "Log Fold Change", "Adjusted P-Value"),
+  caption = "Top 10 Differentially Expressed Genes",
+  digits = 5,
+  row.names = FALSE
+)
+```
+
+### 3.2 DEGs by Braak Stage
+
+```{r DEG by Braak stage}
+# Try Jonckheere's trend test instead of ANOVA's
+sample_data$Braak <- as.ordered(sample_data$Braak)
+results <- apply(ex_filtered, 1, function(x) {
+  clinfun::jonckheere.test(x, sample_data$Braak, alternative = "two.sided")$p.value
+})
+results <- data.frame(Gene = rownames(ex_filtered), P.Value = results)
+results$adj.p <- p.adjust(results$P.Value, method="BH")
+options(scipen=999)
+cat("Ex. 1, Jonckheere's trend test: Number of significant genes at level 0.01:", sum(results$adj.p <= 0.01), "\n")
+# 2783 significant genes! Wonderful!
+
+# Extract significant genes
+braak_significant_genes <- results$Gene[results$adj.p <= 0.01]
+
+# Identify whether significant genes are up-regulated or down-regulated
+# Using method of fitting linear model for each gene with linear contrast and weighted effects codes
+
+# Load necessary libraries for linear modeling and data manipulation
+library(clinfun)
+library(dplyr)
+
+# Subset the expression matrix to include only significant genes
+significant_expr <- ex_filtered[rownames(ex_filtered) %in% braak_significant_genes, ]
+
+# Define the Braak stages and their sample sizes
+braak_levels <- c("0", "I", "II", "III", "IV", "V", "VI")
+braak_counts <- c(178, 2, 3, 11, 18, 15, 2)
+
+# Create weighted effects codes for the Braak stages
+braak_stage <- factor(sample_data$Braak, levels = braak_levels, ordered = TRUE)
+braak_weights <- braak_counts / sum(braak_counts)
+effects_code_matrix <- model.matrix(~ braak_stage, contrasts.arg = list(braak_stage = contr.sum(length(braak_levels))))
+weighted_effects <- t(t(effects_code_matrix) * braak_weights)
+
+# Determine trend direction using a linear model for each gene with weighted effects codes
+trend_direction <- apply(significant_expr, 1, function(expr_values) {
+  model <- lm(expr_values ~ weighted_effects - 1) # Fit model without intercept using weighted effects
+  coefficients <- coef(model)
+  mean_slope <- mean(coefficients) # Use mean slope across effects to determine overall trend
+
+  if (mean_slope > 0) {
+    return("Up-Regulated")
+  } else if (mean_slope < 0) {
+    return("Down-Regulated")
+  } else {
+    return("No Clear Trend")
+  }
+})
+
+# Create a final data frame summarizing significant genes and their trend directions
+final_results <- data.frame(
+  Gene = braak_significant_genes,
+  adj.p = results$adj.p[results$adj.p <= 0.01],
+  trend = trend_direction
+)
+
+# Output the number of up-regulated and down-regulated genes
+cat("Number of Up-Regulated Genes:", sum(final_results$trend == "Up-Regulated"), "\n")
+cat("Number of Down-Regulated Genes:", sum(final_results$trend == "Down-Regulated"), "\n")
+
+# Example: Inspect the first few rows of the final results
+head(final_results)
+
+
+```
+
+### 3.3 Comparing the two methods
+
+```{r compare Braak against C v AD analysis}
+
+# Separate up/down regulated genes from Control vs AD analysis
+ad_up_genes <- rownames(control_vs_ad_degs)[control_vs_ad_degs$logFC > 0]
+ad_down_genes <- rownames(control_vs_ad_degs)[control_vs_ad_degs$logFC < 0]
+
+# Convert braak trend results to gene names for comparison
+braak_up_genes <- final_results$Gene[final_results$trend == "Up-Regulated"]
+braak_down_genes <- final_results$Gene[final_results$trend == "Down-Regulated"]
+
+up_overlap <- intersect(ad_up_genes, braak_up_genes)
+down_overlap <- intersect(ad_down_genes, braak_down_genes)
+
+# Create summary dataframe of overlaps
+overlap_summary <- data.frame(
+  Direction = c("Up-regulated", "Down-regulated"),
+  Control_AD = c(length(ad_up_genes), length(ad_down_genes)),
+  Braak = c(length(braak_up_genes), length(braak_down_genes)),
+  Overlap = c(length(up_overlap), length(down_overlap)),
+  Overlap_Percent = c(
+    round(length(up_overlap) / min(length(ad_up_genes), length(braak_up_genes)) * 100, 2),
+    round(length(down_overlap) / min(length(ad_down_genes), length(braak_down_genes)) * 100, 2)
+  )
+)
+
+# Print nice table
+knitr::kable(
+  overlap_summary,
+  col.names = c("Direction", "Control vs AD", "Braak Trend", "Overlapping", "Overlap %"),
+  caption = "Comparison of DEGs between analyses"
+)
+
+# Create Venn diagrams in separate plot commands
+par(mfrow = c(1,1))
+grid.newpage()
+venn.plot <- venn.diagram(
+  x = list(
+    "Control vs AD" = ad_up_genes,
+    "Braak Trend" = braak_up_genes
+  ),
+  filename = NULL,
+  fill = c("#56B4E9", "#D55E00"),
+  alpha = 0.5,
+  main = "Up-regulated Genes Overlap"
+)
+grid.draw(venn.plot)
+
+grid.newpage()
+venn.plot2 <- venn.diagram(
+  x = list(
+    "Control vs AD" = ad_down_genes,
+    "Braak Trend" = braak_down_genes
+  ),
+  filename = NULL,
+  fill = c("#56B4E9", "#D55E00"),
+  alpha = 0.5,
+  main = "Down-regulated Genes Overlap"
+)
+grid.draw(venn.plot2)
+
+
+```
+
+## 4. Visualization of DEG Analysis
+
+### 4.1 Visualization of Disease v Control
+
+``` {r visualization of DEGs}
+# Select top 50 genes
+topN <- 50
+top_genes <- rownames(significant_genes)[1:topN]
+ex_top <- ex_filtered[top_genes,]
+
+# Prepare annotations
+annotation_col <- data.frame(
+  Status = sample_data$Status,
+  Brain_Region = sample_data$Brain_Region,
+  row.names = sample_data$Sample
+)
+
+# Order samples by Status
+status_order <- order(sample_data$Status)
+ex_top_ordered <- ex_top[, status_order]
+annotation_col_ordered <- annotation_col[status_order,]
+
+# Hierarchical clustering
+dist_samples <- dist(t(ex_top))
+hc_samples <- hclust(dist_samples, method = "complete")
+
+# Align annotation_col with the order in hc_samples
+annotation_col_aligned <- annotation_col[match(hc_samples$labels, rownames(annotation_col)), ]
+
+# Create labels using the aligned annotations to match dendrogram order
+hc_labels <- ifelse(annotation_col_aligned$Status == "AD", "AD", "")
+
+plot(hc_samples, labels = hc_labels, 
+     main = "Sample Clustering Dendrogram by Disease Status")
+rect.hclust(hc_samples, k = 2, border = c("red", "blue"))
+
+# Create heatmap
+annotation_col_simplified <- annotation_col_ordered %>%
+  dplyr::select(Status)
+
+ann_colors <- list(
+  Status = c(Control = "#56B4E9", AD = "#D55E00"),  # Colorblind friendly blue and orange
+  Category = c(Immune = "#009E73", Synaptic = "#CC79A7", Tau = "#E69F00")  # Green, pink, yellow
+)
+
+pheatmap(
+  ex_top_ordered,
+  scale = "row",
+  annotation_col = annotation_col_simplified,
+  annotation_colors = ann_colors,
+  cluster_cols = FALSE,
+  cluster_rows = TRUE,
+  show_colnames = FALSE,
+  show_rownames = TRUE,
+  fontsize_row = 6,
+  main = "Heatmap of Top Differentially Expressed Genes in Control vs AD"
+)
+```
+
+### 4.2 Visualization of Braak Stage analysis
+
+```{r test braak stage for spurious correlation}
+# Identify Braak-specific genes (those not in Control vs AD analysis)
+braak_specific <- setdiff(braak_significant_genes, rownames(control_vs_ad_degs))
+cat("Number of Braak-specific genes:", length(braak_specific), "\n")
+
+# Get expression data for these genes
+braak_specific_expr <- ex_filtered[braak_specific, ]
+
+# Convert to long format for plotting
+braak_specific_long <- melt(braak_specific_expr)
+colnames(braak_specific_long) <- c("Gene", "Sample", "Expression")
+
+# Add Braak stage information - THIS WAS MISSING
+braak_specific_long$Braak <- sample_data$Braak[match(braak_specific_long$Sample, sample_data$Sample)]
+
+# Calculate correlations for all Braak-specific genes
+braak_correlations <- braak_specific_long %>%
+  group_by(Gene) %>%
+  summarize(
+    correlation = cor(as.numeric(Braak), Expression, method = "spearman"),
+    p_value = cor.test(as.numeric(Braak), Expression, method = "spearman")$p.value
+  ) %>%
+  arrange(p_value)
+# Filter for top 12 most correlated genes
+braak_specific_top12 <- braak_specific_long %>%
+  filter(Gene %in% (braak_correlations %>% 
+                    arrange(desc(abs(correlation))) %>% 
+                    head(12) %>% 
+                    pull(Gene)))
+
+# Create the plot with 3x4 grid
+ggplot(braak_specific_top12, aes(x = Braak, y = Expression)) +
+  geom_boxplot(aes(fill = Braak), alpha = 0.5) +
+  geom_smooth(method = "lm", color = "red", se = TRUE) +
+  facet_wrap(~Gene, scales = "free_y", ncol = 4, nrow = 3) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "none",
+    strip.text = element_text(size = 11),  # slightly larger text
+    panel.spacing = unit(1.5, "lines")    # more space between panels
+  ) +
+  scale_fill_brewer(palette = "Oranges") +
+  labs(
+    title = "Expression Patterns of Top 12 Braak-Specific Genes",
+    subtitle = "Sorted by correlation strength",
+    x = "Braak Stage",
+    y = "Expression Level"
+  )
+
+# Create summary table instead of cat statements
+correlation_summary <- data.frame(
+  Metric = c("Mean absolute correlation", "Number of significant correlations (p < 0.05)"),
+  Value = c(
+    mean(abs(braak_correlations$correlation)),
+    sum(braak_correlations$p_value < 0.05)
+  )
+)
+
+knitr::kable(correlation_summary)
+
+# Create histogram of correlation strengths
+hist(abs(braak_correlations$correlation),
+     main = "Distribution of Correlation Strengths",
+     xlab = "Absolute Spearman Correlation",
+     breaks = 10)
+```
+
+
+## 5. GO and KEGG Analysis
+
+```{r GO and KEGG}
+# Separate up/down regulated genes
+up_genes <- rownames(significant_genes)[significant_genes$logFC > 0]
+down_genes <- rownames(significant_genes)[significant_genes$logFC < 0]
+
+# Get Entrez IDs
+up_entrez <- na.omit(probe_annotations_unique$ENTREZID[match(up_genes, probe_annotations_unique$SYMBOL)])
+down_entrez <- na.omit(probe_annotations_unique$ENTREZID[match(down_genes, probe_annotations_unique$SYMBOL)])
+
+# GO Analysis
+go_up <- enrichGO(
+  gene = as.character(up_entrez),
+  OrgDb = org.Hs.eg.db,
+  ont = "BP",
+  keyType = "ENTREZID",
+  pAdjustMethod = "BH",
+  pvalueCutoff = 0.05
+)
+
+go_down <- enrichGO(
+  gene = as.character(down_entrez),
+  OrgDb = org.Hs.eg.db,
+  ont = "BP",
+  keyType = "ENTREZID",
+  pAdjustMethod = "BH",
+  pvalueCutoff = 0.05
+)
+
+# KEGG Analysis
+kegg_up <- enrichKEGG(
+  gene = as.character(up_entrez),
+  organism = "hsa",
+  pvalueCutoff = 0.05,
+  keyType = "ncbi-geneid"
+)
+
+kegg_down <- enrichKEGG(
+  gene = as.character(down_entrez),
+  organism = "hsa",
+  pvalueCutoff = 0.05,
+  keyType = "ncbi-geneid"
+)
+
+# Plot GO results
+if(!is.null(go_up) && nrow(go_up@result) > 0) {
+  go_up_plot <- head(go_up@result, 15)
+  p_go_up <- ggplot(go_up_plot, 
+                    aes(x = Count, y = reorder(Description, Count))) +
+    geom_bar(stat = "identity", fill = "red", alpha = 0.7) +
+    theme_minimal() +
+    labs(title = "Top GO Terms - Upregulated Genes",
+         x = "Gene Count", y = "GO Term")
+  print(p_go_up)
+}
+
+if(!is.null(go_down) && nrow(go_down@result) > 0) {
+  go_down_plot <- head(go_down@result, 15)
+  p_go_down <- ggplot(go_down_plot, 
+                      aes(x = Count, y = reorder(Description, Count))) +
+    geom_bar(stat = "identity", fill = "blue", alpha = 0.7) +
+    theme_minimal() +
+    labs(title = "Top GO Terms - Downregulated Genes",
+         x = "Gene Count", y = "GO Term")
+  print(p_go_down)
+}
+# Plot KEGG results
+if(!is.null(kegg_up) && nrow(kegg_up@result) > 0) {
+    kegg_up_plot <- head(kegg_up@result, 15)
+    kegg_up_plot$GeneRatio <- sapply(kegg_up_plot$GeneRatio, function(x) {
+        nums <- as.numeric(strsplit(x, "/")[[1]])
+        nums[1]/nums[2]
+    })
+    
+    p_kegg_up <- ggplot(kegg_up_plot, 
+                        aes(x = GeneRatio, 
+                            y = reorder(Description, GeneRatio))) +
+        geom_point(aes(size = Count), color = "#D55E00") +
+        theme_minimal() +
+        labs(title = "Top KEGG Pathways - Upregulated Genes",
+             x = "Gene Ratio", y = "Pathway")
+    print(p_kegg_up)
+}
+
+if(!is.null(kegg_down) && nrow(kegg_down@result) > 0) {
+    kegg_down_plot <- head(kegg_down@result, 15)
+    kegg_down_plot$GeneRatio <- sapply(kegg_down_plot$GeneRatio, function(x) {
+        nums <- as.numeric(strsplit(x, "/")[[1]])
+        nums[1]/nums[2]
+    })
+    
+    p_kegg_down <- ggplot(kegg_down_plot, 
+                          aes(x = GeneRatio, 
+                              y = reorder(Description, GeneRatio))) +
+        geom_point(aes(size = Count), color = "#56B4E9") +
+        theme_minimal() +
+        labs(title = "Top KEGG Pathways - Downregulated Genes",
+             x = "Gene Ratio", y = "Pathway")
+    print(p_kegg_down)
+}
+
+```
+
+## 6. Analysis of Genes Known to Relate to Alzheimer's Disease
+
+``` {r AD gene analysis}
+# Define gene sets
+immune_genes <- c("CD74", "CD86", "TLR4", "C3", "CCL2")
+synaptic_genes <- c("SNAP25", "SYN1", "SYN2", "VAMP2", "DLG4", "GRIA1", "GRIA2")
+tau_genes <- c("MAPT", "FKBP5", "HSP90AA1", "STUB1")
+
+# Function to analyze gene sets
+analyze_gene_set <- function(gene_set, ex_data, sample_data, set_name) {
+  genes_present <- intersect(gene_set, rownames(ex_data))
+  if(length(genes_present) == 0) return(NULL)
+  
+  gene_expr <- ex_data[genes_present,]
+  
+  # Convert to long format
+  gene_expr_long <- reshape2::melt(gene_expr)
+  colnames(gene_expr_long) <- c("Gene", "Sample", "Expression")
+  gene_expr_long$Status <- sample_data$Status[match(gene_expr_long$Sample, sample_data$Sample)]
+  
+  # Create boxplot
+  p <- ggplot(gene_expr_long, aes(x = Status, y = Expression, fill = Status)) +
+    geom_boxplot() +
+    facet_wrap(~Gene, scales = "free_y") +
+    theme_minimal() +
+    scale_fill_manual(values = c("Control" = "#56B4E9", "AD" = "#D55E00")) +  # Colorblind friendly
+    labs(title = paste(set_name, "Gene Expression in Control vs AD"))
+  
+  # Perform t-tests
+  stat_results <- lapply(genes_present, function(gene) {
+    t_res <- t.test(gene_expr[gene,] ~ sample_data$Status)
+    data.frame(
+      Gene = gene,
+      t_stat = t_res$statistic,
+      P_value = t_res$p.value,
+      Mean_diff = diff(t_res$estimate)
+    )
+  })
+  stat_results <- do.call(rbind, stat_results)
+  
+  return(list(plot = p, stats = stat_results))
+}
+
+# Analyze each gene set
+immune_results <- analyze_gene_set(immune_genes, ex_filtered, sample_data, "Immune")
+synaptic_results <- analyze_gene_set(synaptic_genes, ex_filtered, sample_data, "Synaptic")
+tau_results <- analyze_gene_set(tau_genes, ex_filtered, sample_data, "Tau Pathway")
+
+# Print results
+print(immune_results$plot)
+print(synaptic_results$plot)
+print(tau_results$plot)
+
+# Create combined stats table
+all_stats <- rbind(
+  cbind(immune_results$stats, Category = "Immune"),
+  cbind(synaptic_results$stats, Category = "Synaptic"),
+  cbind(tau_results$stats, Category = "Tau")
+)
+
+all_genes <- unique(c(immune_genes, synaptic_genes, tau_genes))
+gene_info <- AnnotationDbi::select(
+  org.Hs.eg.db,
+  keys = all_genes,
+  columns = c("SYMBOL", "GENENAME"),
+  keytype = "SYMBOL"
+)
+all_stats <- merge(all_stats, gene_info, by.x = "Gene", by.y = "SYMBOL", all.x = TRUE)
+
+# Add significance markers
+all_stats$Significance <- ifelse(all_stats$P_value < 0.001, "***",
+                               ifelse(all_stats$P_value < 0.01, "**",
+                                     ifelse(all_stats$P_value < 0.05, "*", "ns")))
+
+all_stats <- all_stats %>%
+  dplyr::select(Gene, GENENAME, t_stat, P_value, Mean_diff, Category, Significance)
+
+all_stats <- all_stats %>%
+  arrange(Category, desc(abs(t_stat)))
+
+# Print stats table
+knitr::kable(
+  all_stats,
+  col.names = c("Gene", "Gene Name", "t-statistic", "P-value", "Mean Difference", "Category", "Significance"),
+  digits = c(0, 0, 2, 4, 4, 0, 0),
+  caption = "Statistical Analysis of Key Genes with Gene Names in Control vs AD"
+)
+# Create heatmap of specific genes
+genes_of_interest <- unique(c(immune_genes, synaptic_genes, tau_genes))
+genes_present <- intersect(genes_of_interest, rownames(ex_filtered))
+genes_expr <- ex_filtered[genes_present,]
+
+# Order samples by Status
+status_order <- order(sample_data$Status)
+genes_expr_ordered <- genes_expr[, status_order]
+
+# Create annotations
+annotation_col <- data.frame(
+  Status = sample_data$Status[status_order],
+  row.names = colnames(genes_expr_ordered)
+)
+
+annotation_row <- data.frame(
+  Category = factor(ifelse(rownames(genes_expr) %in% immune_genes, "Immune",
+                          ifelse(rownames(genes_expr) %in% synaptic_genes, "Synaptic", "Tau"))),
+  row.names = rownames(genes_expr)
+)
+
+ann_colors <- list(
+  Status = c(Control = "#56B4E9", AD = "#D55E00"),  # Colorblind friendly blue and orange
+  Category = c(Immune = "#009E73", Synaptic = "#CC79A7", Tau = "#E69F00")  # Green, pink, yellow
+)
+
+# Create final heatmap
+pheatmap(genes_expr_ordered,
+         scale = "row",
+         annotation_col = annotation_col,
+         annotation_row = annotation_row,
+         annotation_colors = ann_colors,
+         cluster_cols = FALSE,
+         cluster_rows = FALSE,
+         show_colnames = FALSE,
+         fontsize_row = 8,
+         main = "Expression of Key Genes in Control vs AD")
+```
+
+
